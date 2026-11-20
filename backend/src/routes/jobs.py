@@ -25,5 +25,6 @@ def approve(id:int,db=Depends(get_db),u=Depends(admin_only)):
     j=db.get(Job,id)
     if not j: raise HTTPException(404,'分析任务不存在')
     if j.status!='completed':raise HTTPException(409,'仅已完成结果可以批准')
+    if j.invalidated:raise HTTPException(409,'该试验受断档补登影响已失效，不能批准；请重新计算')
     j.approved=True; record(db,u.email,'job.approve',{'id':id}); db.commit()
     return job_dict(j)

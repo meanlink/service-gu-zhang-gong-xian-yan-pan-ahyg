@@ -1,4 +1,4 @@
-"""服务事件窗口Jaccard和最近后继的有向时滞关联。"""
+"""服务事件窗口Jaccard和最近后继的有向时滞关联。断档区间内的源事件从跟随率分子分母一并剔除。"""
 from collections import defaultdict
 import numpy as np
 
@@ -12,15 +12,15 @@ def metadata():
         "pains": ["告警次数不同使原始共同次数不可比", "同窗共现容易被误读成先后传播", "人工时间线无法复现实验窗口变化"],
         "upstream": "已去除重复通知的事件归档 service_events_week45.csv；时间以周一00:00起累计分钟表示",
         "downstream": "可靠性复盘会对高Jaccard与短时滞的服务对核查调用日志",
-        "entities": ["服务复核事件", "时窗关联试验", "可靠性复盘简报"],
+        "entities": ["服务复核事件", "时窗关联试验", "可靠性复盘简报", "服务缺测区间"],
         "dataset_name": "桥石五服务本周复核事件序列",
         "columns": [{"key": "event_id", "label": "复核事件ID", "type": "string"}, {"key": "service", "label": "服务名称", "type": "string"}, {"key": "occurred_min", "label": "周内累计分钟", "type": "number"}, {"key": "severity", "label": "事件等级(1~3)", "type": "number"}],
         "parameters": [{"key": "window_min", "label": "同窗及跟随窗口(分钟)", "type": "number", "default": 5, "min": 1, "max": 30}, {"key": "min_pairs", "label": "最少跟随事件数", "type": "number", "default": 3, "min": 2, "max": 20}],
         "workbench_title": "服务事件时窗复盘", "action_label": "计算共现与有向时滞", "unit": "个复核事件",
         "accent": "oklch(63% 0.12 155)", "style": "control-room-industrial",
         "seed_story": ["09:00 值班工程师导入 service_events_week45.csv", "09:10 确认事件已按event_id去重，时间原点均为周一00:00", "09:20 选择5分钟窗口、至少3次跟随", "09:21 后端分别计算占用时间窗Jaccard与最近后继时滞", "09:30 工程师比较cache→api与api→cache方向的跟随率", "09:40 将窗口改为10分钟，查看链条扩张", "10:00 下载服务对明细，回查原始调用链", "17:00 管理员安排每周一09:00可靠性复盘简报"],
-        "method": "固定窗口以累计分钟0为原点；Jaccard=共同占用窗/任一服务占用窗。对每个A事件，仅匹配窗口内最早且严格晚于它的B事件；跟随率=匹配A事件数/A总事件数，输出中位时滞。每个A独立匹配，允许不同A共享B。",
-        "limitations": ["窗口边界会影响Jaccard，必须比较多个窗口", "多个A可共享后继B，不表示一对一故障传播", "共现或先后关系均不足以证明因果"],
+        "method": "固定窗口以累计分钟0为原点；Jaccard=共同占用窗/任一服务占用窗。对每个A事件，仅匹配窗口内最早且严格晚于它的B事件；跟随率=匹配A事件数/有效A事件数，输出中位时滞。每个A独立匹配，允许不同A共享B。源事件的跟随窗内任一方服务存在已登记缺测区间时，该源事件从该方向的跟随率分子与分母一并剔除，不再计为未跟随。",
+        "limitations": ["窗口边界会影响Jaccard，必须比较多个窗口", "多个A可共享后继B，不表示一对一故障传播", "共现或先后关系均不足以证明因果", "缺测剔除依赖人工补登的断档区间，未登记的断档仍会被计为未跟随"],
     }
 
 
@@ -42,7 +42,8 @@ def seed_records():
     return sorted(events, key=lambda row: row["occurred_min"])
 
 
-def analyze(records, params):
+def _prepare(records, params):
+    """校验参数与事件，返回 (按服务分组的有序(分钟,事件ID), 窗口, 最少跟随数)。"""
     try:
         window = float(params.get("window_min", 5))
         raw_min = float(params.get("min_pairs", 3))
@@ -68,35 +69,123 @@ def analyze(records, params):
         if event_id in identifiers:
             raise ValueError("事件ID重复，请先去重，避免人为放大关联。")
         identifiers.add(event_id)
-        grouped[service].append(minute)
+        grouped[service].append((minute, event_id))
     if not 2 <= len(grouped) <= 12:
         raise ValueError("一次试验须包含2~12个服务。")
-    times = {key: np.sort(values) for key, values in grouped.items()}
+    prepared = {key: sorted(values) for key, values in grouped.items()}
+    return prepared, window, minimum
+
+
+def _gap_map(gaps):
+    """把登记的缺测区间整理为 服务→有序区间列表；区间须有限且 start<=end。"""
+    mapping = defaultdict(list)
+    for gap in gaps or []:
+        try:
+            service = str(gap.get("service", "")).strip()
+            start = float(gap.get("start_min"))
+            end = float(gap.get("end_min"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("缺测区间的服务与时间须完整有效。") from exc
+        if not service or not np.isfinite(start) or not np.isfinite(end) or start < 0 or end < start:
+            raise ValueError("缺测区间须为非负有限分钟，且起点不晚于终点。")
+        mapping[service].append((start, end))
+    return {key: sorted(values) for key, values in mapping.items()}
+
+
+def _hits_gap(intervals, start, end):
+    """闭区间重叠：跟随窗 [start,end] 与任一缺测区间相交即视为缺测。"""
+    for gap_start, gap_end in intervals:
+        if gap_start > end:
+            break
+        if start <= gap_end:
+            return True
+    return False
+
+
+def _blocked_services(gap_services, instant, window):
+    """跟随窗 [instant, instant+window] 内缺测的服务集合。"""
+    return {service for service, intervals in gap_services if _hits_gap(intervals, instant, instant + window)}
+
+
+def analyze(records, params, gaps=None):
+    grouped, window, minimum = _prepare(records, params)
+    gap_services = sorted(_gap_map(gaps).items())
+    times = {key: np.array([minute for minute, _ in values]) for key, values in grouped.items()}
     occupied = {key: set(np.floor(values / window).astype(int).tolist()) for key, values in times.items()}
     rows = []
     for a in sorted(times):
+        blocked_at = {float(instant): _blocked_services(gap_services, float(instant), window) for instant in times[a]}
         for b in sorted(times):
             if a == b:
                 continue
             lags = []
+            excluded = 0
             for instant in times[a]:
+                blocked = blocked_at[float(instant)]
+                if a in blocked or b in blocked:
+                    excluded += 1
+                    continue
                 index = int(np.searchsorted(times[b], instant, side="right"))
                 if index < len(times[b]) and times[b][index] - instant <= window:
                     lags.append(float(times[b][index] - instant))
-            if len(lags) < minimum:
+            eligible = len(times[a]) - excluded
+            if len(lags) < minimum or eligible <= 0:
                 continue
             union = len(occupied[a] | occupied[b])
             intersection = len(occupied[a] & occupied[b])
-            rows.append({"source": a, "target": b, "source_events": len(times[a]), "follow_count": len(lags), "follow_pct": round(len(lags) / len(times[a]) * 100, 2), "median_lag_min": round(float(np.median(lags)), 3), "jaccard": round(intersection / union, 4), "shared_windows": intersection})
+            rows.append({"source": a, "target": b, "source_events": eligible, "excluded_events": excluded, "follow_count": len(lags), "follow_pct": round(len(lags) / eligible * 100, 2), "median_lag_min": round(float(np.median(lags)), 3), "jaccard": round(intersection / union, 4), "shared_windows": intersection})
     rows.sort(key=lambda row: (-row["follow_pct"], -row["follow_count"], row["source"], row["target"]))
     for rank, row in enumerate(rows, 1):
         row["link_id"] = f"L{rank:02}"
     top = rows[:8]
+    gap_list = [{"id": gap.get("id"), "service": gap.get("service"), "start_min": gap.get("start_min"), "end_min": gap.get("end_min")} for gap in (gaps or [])]
+    total_excluded = sum(row["excluded_events"] for row in rows)
+    summary = f"{len(records)}个事件覆盖{len(times)}个服务；{window:g}分钟窗口下，{len(rows)}条有向服务对满足至少{minimum}次跟随。"
+    if gap_list:
+        summary += f"已应用{len(gap_list)}段缺测登记，候选服务对内共剔除{total_excluded}个断档源事件。"
+    metrics = [{"label": "复核事件", "value": len(records)}, {"label": "服务数量", "value": len(times)}, {"label": "有向关联候选", "value": len(rows)}, {"label": "最高跟随率", "value": max([row["follow_pct"] for row in rows], default=0), "unit": "%"}]
+    if gap_list:
+        metrics.append({"label": "缺测剔除事件", "value": total_excluded})
+    findings = ([f"最强跟随方向为{rows[0]['source']}→{rows[0]['target']}，中位时滞{rows[0]['median_lag_min']}分钟。"] if rows else ["当前窗口与最少次数下没有候选服务对，可核对时间范围后调整窗口。"])
+    findings += ["Jaccard衡量同窗重合，有向跟随率衡量先后顺序，两者不可互相替代。", "每个源事件仅取最近后继；扩大窗口可能提高跟随率，也会引入偶然匹配。"]
+    if gap_list:
+        findings.append("跟随窗落在缺测区间内的源事件已从分子分母一并剔除，剔除明细见断档补登页。")
     return {
-        "summary": f"{len(records)}个事件覆盖{len(times)}个服务；{window:g}分钟窗口下，{len(rows)}条有向服务对满足至少{minimum}次跟随。",
-        "metrics": [{"label": "复核事件", "value": len(records)}, {"label": "服务数量", "value": len(times)}, {"label": "有向关联候选", "value": len(rows)}, {"label": "最高跟随率", "value": max([row["follow_pct"] for row in rows], default=0), "unit": "%"}],
-        "table": {"columns": [{"key": "link_id", "label": "服务对编号"}, {"key": "source", "label": "先发生服务A"}, {"key": "target", "label": "后继服务B"}, {"key": "source_events", "label": "A事件数"}, {"key": "follow_count", "label": "跟随次数"}, {"key": "follow_pct", "label": "跟随率(%)"}, {"key": "median_lag_min", "label": "中位时滞(min)"}, {"key": "jaccard", "label": "同窗Jaccard"}, {"key": "shared_windows", "label": "共同占用窗"}], "rows": rows},
+        "summary": summary,
+        "metrics": metrics,
+        "table": {"columns": [{"key": "link_id", "label": "服务对编号"}, {"key": "source", "label": "先发生服务A"}, {"key": "target", "label": "后继服务B"}, {"key": "source_events", "label": "有效A事件数"}, {"key": "excluded_events", "label": "缺测剔除数"}, {"key": "follow_count", "label": "跟随次数"}, {"key": "follow_pct", "label": "跟随率(%)"}, {"key": "median_lag_min", "label": "中位时滞(min)"}, {"key": "jaccard", "label": "同窗Jaccard"}, {"key": "shared_windows", "label": "共同占用窗"}], "rows": rows},
         "chart": {"type": "bar", "labels": [row["link_id"] for row in top], "series": ([{"name": "跟随率%（服务对编号见明细）", "values": [row["follow_pct"] for row in top]}] if top else [])},
-        "findings": ([f"最强跟随方向为{rows[0]['source']}→{rows[0]['target']}，中位时滞{rows[0]['median_lag_min']}分钟。"] if rows else ["当前窗口与最少次数下没有候选服务对，可核对时间范围后调整窗口。"])+["Jaccard衡量同窗重合，有向跟随率衡量先后顺序，两者不可互相替代。", "每个源事件仅取最近后继；扩大窗口可能提高跟随率，也会引入偶然匹配。"],
+        "findings": findings,
         "method": metadata()["method"], "warnings": ["有向先后关系不是故障因果链，需回查调用与变更记录。"] + (["没有满足阈值的服务对。"] if not rows else []),
+        "applied_gaps": gap_list,
     }
+
+
+def exclusions(records, params, gaps=None, sample_limit=100):
+    """剔除依据：逐方向列出因缺测被剔除的源事件及其命中的缺测区间。"""
+    grouped, window, _ = _prepare(records, params)
+    gap_services = sorted(_gap_map(gaps).items())
+    gap_refs = {service: [gap for gap in (gaps or []) if str(gap.get("service", "")).strip() == service] for service, _ in gap_services}
+    directions = []
+    for a in sorted(grouped):
+        targets = sorted(set(grouped) - {a})
+        per_target = {b: [] for b in targets}
+        for minute, event_id in grouped[a]:
+            blocked = _blocked_services(gap_services, minute, window)
+            if a in blocked:
+                chosen = targets
+            else:
+                chosen = [b for b in targets if b in blocked]
+            for b in chosen:
+                causes = []
+                for service in sorted({a, b} & blocked):
+                    for gap in gap_refs.get(service, []):
+                        if float(gap.get("start_min")) <= minute + window and minute <= float(gap.get("end_min")):
+                            causes.append({"gap_id": gap.get("id"), "service": service, "start_min": gap.get("start_min"), "end_min": gap.get("end_min")})
+                per_target[b].append({"event_id": event_id, "occurred_min": minute, "window_end": round(minute + window, 4), "gaps": causes})
+        for b in targets:
+            events = per_target[b]
+            if not events:
+                continue
+            directions.append({"source": a, "target": b, "excluded_events": len(events), "eligible_events": len(grouped[a]) - len(events), "sample": events[:sample_limit], "sample_truncated": max(0, len(events) - sample_limit)})
+    return {"window_min": window, "gaps": [{"id": gap.get("id"), "service": gap.get("service"), "start_min": gap.get("start_min"), "end_min": gap.get("end_min"), "registered_at": gap.get("registered_at")} for gap in (gaps or [])], "directions": directions}

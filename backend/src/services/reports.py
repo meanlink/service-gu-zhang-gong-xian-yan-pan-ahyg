@@ -1,17 +1,26 @@
 import time, os, csv, io, hashlib, json
 from fastapi import HTTPException
+from sqlalchemy import select
 from src.models import Job, Report, Delivery
+from src.services.audit import record
 from src.config.settings import ARTIFACT_DIR
 def create(db, data):
     j=db.get(Job,data.job_id)
+    if j and j.invalidated:
+        raise HTTPException(409,'该试验受断档补登影响已失效，请重新计算并批准后再安排分发')
     if not j or j.status!='completed' or not j.approved:
         raise HTTPException(409,'请先选择已完成且获批准的分析结果')
     r=Report(name=data.name, job_id=j.id, destination=data.destination, interval_seconds=data.interval_seconds, next_run=time.time()+data.delay_seconds, enabled=True)
     db.add(r); db.flush()
     return r
 def deliver(db, report):
-    j=db.get(Job,report.job_id)
-    if not j or not j.approved: return
+    # 行锁与补登标记串行化：登记先提交则拦下简报；已发简报保留原取样依据
+    j=db.scalar(select(Job).where(Job.id==report.job_id).with_for_update())
+    if not j: return
+    if j.invalidated:
+        record(db,'worker','report.blocked',{'id':report.id,'job':j.id,'reason':'断档补登后试验已失效'})
+        return
+    if not j.approved: return
     out=io.StringIO()
     out.write('\ufeff')
     table=j.result.get('table',{})

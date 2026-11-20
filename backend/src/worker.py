@@ -4,9 +4,10 @@ from sqlalchemy import select
 from redis import Redis
 from src.config.database import Session
 from src.config.settings import REDIS_URL
-from src.models import Job, Dataset, Report
+from src.models import Job, Dataset, Report, GapInterval
 from src.services.business import analyze
 from src.services.reports import deliver
+from src.services.gaps import recover_pending
 from src.services.audit import record
 logging.basicConfig(level=logging.INFO)
 def execute(job_id):
@@ -16,7 +17,8 @@ def execute(job_id):
         j.status='running'; db.commit()
         try:
             d=db.get(Dataset,j.dataset_id)
-            result=analyze(d.records,j.params)
+            gaps=[{'id':g.id,'service':g.service,'start_min':g.start_min,'end_min':g.end_min} for g in db.scalars(select(GapInterval).where(GapInterval.dataset_id==d.id))]
+            result=analyze(d.records,j.params,gaps)
             json.dumps(result,allow_nan=False)
             j.result=result;j.status='completed';j.finished_at=time.time()
             record(db,'worker','job.completed',{'id':j.id})
@@ -40,6 +42,7 @@ def main():
     with Session() as db:
         for j in db.scalars(select(Job).where(Job.status=='running')):
             j.status='queued';record(db,'worker','job.recovered',{'id':j.id})
+        recover_pending(db)  # 中断后恢复未完的失效标记
         db.commit()
     while True:
         Path('/tmp/heartbeat').touch()
